@@ -45,6 +45,12 @@ TARGETS = [
         "list_url": f"{MOEL_BASE}/info/lawinfo/instruction/list.do",
         "view_url": f"{MOEL_BASE}/info/lawinfo/instruction/view.do",
     },
+    {
+        "name": "최근 제·개정 법령",
+        "tag": "제개정법령",
+        "list_url": f"{MOEL_BASE}/info/lawinfo/revision/list.do",
+        "view_url": f"{MOEL_BASE}/info/lawinfo/revision/view.do",
+    },
 ]
 
 SEARCH_KEYWORD = "안전"
