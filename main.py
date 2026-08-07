@@ -1,16 +1,22 @@
 # ============================================
 # 🏭 고용노동부 안전 관련 공고 → 네이버 카페 자동 게시
-# GitHub Actions 자동 실행 버전 (v4 - 네트워크 재시도 강화)
+# GitHub Actions 자동 실행 버전 (v3.1 - 원본 유지 + 최소 안전 보완)
 #
 # 대상:
 #   1) 입법·행정예고 (lawmaking)
 #   2) 훈령·예규·고시 (instruction)
 #   3) 최근 제·개정 법령 (revision)
 # 검색어: "안전"
+#
+# 🆕 v3 대비 변경점 (최소):
+#   1) sys.stdout 실시간 flush (GitHub Actions 로그 실시간 표시)
+#   2) http_get() 헬퍼로 네트워크 일시 장애 시 자동 재시도
+#      → 정상 상황에서는 원본과 100% 동일 동작
 # ============================================
 
 import os
 import re
+import sys
 import json
 import time
 import requests
@@ -18,6 +24,12 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, urljoin
 from bs4 import BeautifulSoup
+
+# 🆕 실시간 로그 출력 (GitHub Actions에서 진행상황 즉시 확인용)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 # ============================================
 # ⚙️ 환경변수
@@ -69,22 +81,22 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/125.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-    "Referer": "https://www.moel.go.kr/",
-    "Connection": "keep-alive",
 }
 
 # ============================================
-# 🌐 안정적인 HTTP GET (재시도 + 백오프)
+# 🌐 HTTP GET (원본 requests.get 대체 - 재시도만 추가)
 # ============================================
-def http_get(url: str, params: dict = None, max_attempts: int = 4, timeout: int = 60) -> requests.Response:
+def http_get(url: str, params: dict = None, timeout: int = 30) -> requests.Response:
     """
-    네트워크 오류/타임아웃 발생 시 지수 백오프로 재시도.
-    대기: 3초 → 8초 → 15초 → 25초
+    원본의 requests.get(url, params=params, headers=HEADERS, timeout=30) 과 동일하지만
+    ConnectTimeout/ReadTimeout/ConnectionError 시 최대 3회까지 재시도 (2초 → 5초 대기).
+    정상 응답 시에는 원본과 100% 동일한 Response 반환.
     """
     last_err = None
-    waits = [3, 8, 15, 25]
+    waits = [2, 5]  # 재시도 사이 대기(초)
+    max_attempts = 3
+
     for attempt in range(1, max_attempts + 1):
         try:
             r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
@@ -92,15 +104,19 @@ def http_get(url: str, params: dict = None, max_attempts: int = 4, timeout: int 
             return r
         except (requests.exceptions.ConnectTimeout,
                 requests.exceptions.ReadTimeout,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.HTTPError) as e:
+                requests.exceptions.ConnectionError) as e:
             last_err = e
-            wait = waits[min(attempt - 1, len(waits) - 1)]
-            print(f"      ⚠️ 요청 실패 (시도 {attempt}/{max_attempts}) - {type(e).__name__}: {str(e)[:120]}")
             if attempt < max_attempts:
-                print(f"      ⏳ {wait}초 후 재시도...")
+                wait = waits[attempt - 1]
+                print(f"      ⚠️ 네트워크 오류 (시도 {attempt}/{max_attempts}): {type(e).__name__} → {wait}초 후 재시도")
                 time.sleep(wait)
-    # 모든 시도 실패 → 예외를 상위로 전파
+            else:
+                print(f"      ❌ 네트워크 오류 최종 실패 (시도 {attempt}/{max_attempts}): {type(e).__name__}")
+        except requests.exceptions.HTTPError as e:
+            # HTTP 4xx/5xx 는 원본과 동일하게 즉시 예외 raise
+            raise
+
+    # 모든 재시도 실패 → 예외 raise (원본과 동일 흐름)
     raise last_err
 
 # ============================================
@@ -171,30 +187,38 @@ def clean_title(text: str) -> str:
 def prettify_body(text: str) -> str:
     """
     본문 텍스트를 문장 단위로 자연스럽게 줄바꿈하여 가독성 향상.
+    - 마침표/물음표/느낌표 뒤에서 문장 나눔
+    - 항목 구분(*, -, ·, 붙임, 시행, 공포 등) 앞에서 나눔
+    - 문단 간 빈 줄 삽입
     """
     if not text:
         return ""
 
+    # 1) 여러 줄을 문단 단위로 분리 (빈 줄 = 문단 경계)
     paragraphs = re.split(r'\n\s*\n', text)
 
     processed = []
     for para in paragraphs:
+        # 한 줄로 합침 (문단 내부)
         one = re.sub(r'\s+', ' ', para).strip()
         if not one:
             continue
 
-        # 문장 끝(마침표/? / !) 뒤에 개행
+        # 2) 문장 끝(마침표/? / !) 뒤에 개행
         one = re.sub(r'(?<=[.!?])\s+(?=\S)', '\n', one)
 
-        # 특정 키워드 앞에서 개행
+        # 3) 한글 종결어미 뒤에도 개행 (다./요./임./음. 등이 이미 위에서 처리됨)
+
+        # 4) 특정 키워드 앞에서 개행 (붙임, 공포, 시행, * 등)
         one = re.sub(r'\s+(?=(붙임|공포\s*:|시행\s*:|\*\s|-\s|·\s))', '\n', one)
 
-        # 번호매김 앞에서 개행
+        # 5) 번호매김 (1., 2., 가., 나. 등) 앞에서 개행
         one = re.sub(r'\s+(?=\d{1,2}\.\s)', '\n', one)
         one = re.sub(r'\s+(?=[가-힣]\.\s)', '\n', one)
 
         processed.append(one.strip())
 
+    # 문단 사이는 빈 줄
     return '\n\n'.join(processed)
 
 def text_to_html(text: str) -> str:
@@ -211,7 +235,7 @@ def text_to_html(text: str) -> str:
         p = p.strip()
         if not p:
             continue
-        # HTML 특수문자 이스케이프
+        # HTML 특수문자 이스케이프 (본문의 <, > 문자가 태그로 오인되지 않게)
         p = p.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         p = p.replace('\n', '<br>')
         html_paras.append(f"<p>{p}</p>")
@@ -233,6 +257,7 @@ NOISE_KEYWORDS = [
     "일자리에서", "마음껏",
 ]
 
+# 라인에 포함되면 무조건 제거하는 슬로건 (부분일치)
 SLOGAN_FRAGMENTS = [
     "국민 누구나 원하는 일자리",
     "역량을 발휘하는 나라",
@@ -244,6 +269,7 @@ def is_noise_line(line: str) -> bool:
     s = line.strip()
     if not s or len(s) <= 1:
         return True
+    # 슬로건 조각 포함 → 무조건 제거
     for frag in SLOGAN_FRAGMENTS:
         if frag in s:
             return True
@@ -266,7 +292,7 @@ def fetch_list(target: dict, keyword: str) -> list[dict]:
     }
 
     print(f"\n📥 [{target['name']}] 목록 요청: {target['list_url']} (검색어={keyword})")
-    r = http_get(target['list_url'], params=params, timeout=60)
+    r = http_get(target['list_url'], params=params, timeout=30)   # 🆕 http_get (재시도 포함)
     r.encoding = r.apparent_encoding or 'utf-8'
 
     soup = BeautifulSoup(r.text, 'lxml')
@@ -418,9 +444,12 @@ def extract_body_text(soup: BeautifulSoup, meta_table) -> str:
     return text.strip()
 
 # ============================================
-# 📄 상세 - 첨부파일 (dedup + 안정성)
+# 📄 상세 - 첨부파일 (dedup + 안정성 강화)
 # ============================================
 def extract_attachments(soup: BeautifulSoup, base_url: str):
+    """
+    실제 다운로드 가능한 첨부파일만 추출 + 중복 제거.
+    """
     seen_urls = set()
     seen_names = set()
     result = []
@@ -453,10 +482,12 @@ def extract_attachments(soup: BeautifulSoup, base_url: str):
                 file_url = urljoin(base_url, href)
 
         if not file_url and onclick:
+            # onclick="fn_download('atchFileId','fileSn')" 등에서 URL 추출
             m = re.search(r"['\"]([^'\"]*(?:file|download|atch)[^'\"]*)['\"]", onclick, re.I)
             if m:
                 file_url = urljoin(base_url, m.group(1))
 
+        # 그래도 못 찾았지만 링크 텍스트가 명백한 파일이면 원문 링크에 있는 URL 그대로 사용
         if not file_url and href:
             file_url = urljoin(base_url, href)
 
@@ -478,14 +509,19 @@ def extract_attachments(soup: BeautifulSoup, base_url: str):
 # ============================================
 def fetch_detail(view_url: str) -> dict:
     try:
-        r = http_get(view_url, timeout=60)
+        r = http_get(view_url, timeout=30)   # 🆕 http_get (재시도 포함)
         r.encoding = r.apparent_encoding or 'utf-8'
         soup = BeautifulSoup(r.text, 'lxml')
 
+        # 1) 첨부파일 (본문에서 지우기 전에!)
         attachments = extract_attachments(soup, view_url)
+
+        # 2) 메타
         meta, meta_table = extract_meta_table(soup)
+
+        # 3) 본문
         body = extract_body_text(soup, meta_table)
-        body = prettify_body(body)
+        body = prettify_body(body)  # 🆕 가독성 향상
 
         return {
             "meta": meta,
@@ -514,6 +550,7 @@ def build_content(item: dict, target: dict, detail: dict) -> str:
         if k not in meta_order and v:
             meta_lines.append(f"<b>{k}</b> : {v}")
 
+    # 폴백
     if not meta_lines:
         meta_lines.append(f"<b>제목</b> : {item['title']}")
         if item.get('reg_date'):
@@ -521,6 +558,7 @@ def build_content(item: dict, target: dict, detail: dict) -> str:
 
     meta_html = "<br>".join(meta_lines)
 
+    # 본문 HTML 변환 (문단 단위 <p>, 줄바꿈 <br>)
     body_html = text_to_html(body) if body else "<p>(본문을 불러오지 못했습니다. 아래 원문 링크에서 확인해 주세요.)</p>"
 
     parts = [
@@ -534,6 +572,7 @@ def build_content(item: dict, target: dict, detail: dict) -> str:
         body_html,
     ]
 
+    # 첨부파일
     if attachments:
         parts.append("<hr>")
         parts.append(f"<p><b>📎 첨부파일 ({len(attachments)}건)</b></p>")
@@ -574,6 +613,7 @@ def post_to_cafe(token: str, subject: str, content: str) -> requests.Response:
         "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
     }
     subject_enc = naver_double_encode(subject)
+    # 본문: 한글만 엔티티화 (태그는 보존) → 그다음 URL 인코딩
     content_html = to_html_entity(content)
     content_enc = quote(content_html, safe='')
 
@@ -617,7 +657,7 @@ def run():
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst)
     print("=" * 60)
-    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v4)")
+    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v3.1)")
     print(f"⏰ {now.strftime('%Y-%m-%d %H:%M KST')}")
     print("=" * 60)
 
