@@ -30,13 +30,12 @@ jobs:
 
       - name: 🚀 크롤링 & 게시
         env:
-          PYTHONUNBUFFERED: "1"
           NAVER_CLIENT_ID:     ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
           NAVER_REFRESH_TOKEN: ${{ secrets.NAVER_REFRESH_TOKEN }}
           CAFE_ID: "31767633"
           MENU_ID: "13"
-        run: python -u main.py
+        run: python main.py
 
       - name: 💾 상태 파일 커밋
         if: always()
