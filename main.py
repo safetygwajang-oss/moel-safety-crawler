@@ -1,6 +1,12 @@
 # ============================================
 # 🏭 고용노동부 안전 관련 공고 → 네이버 카페 자동 게시
-# GitHub Actions 자동 실행 버전 (v2.3 - 네트워크 재시도 + 본문 정돈)
+# GitHub Actions 자동 실행 버전 (v2 - 본문 정돈 + 첨부 dedup)
+#
+# 대상:
+#   1) 입법·행정예고 (lawmaking)
+#   2) 훈령·예규·고시 (instruction)
+#   3) 최근 제·개정 법령 (revision)
+# 검색어: "안전"
 # ============================================
 
 import os
@@ -50,17 +56,13 @@ TARGETS = [
 
 SEARCH_KEYWORD = "안전"
 
+# 중복방지 저장소
 STATE_DIR = Path("state")
 STATE_DIR.mkdir(exist_ok=True)
 STATE_FILE = STATE_DIR / "posted.json"
 
-UPLOAD_INTERVAL_SEC = 25
-RETRY_WAIT_SEC = 30
-
-# 🆕 MOEL 서버 요청 재시도 설정
-HTTP_MAX_RETRIES = 4        # 최대 4번 시도
-HTTP_RETRY_WAIT = 15        # 실패 시 15초 대기
-HTTP_TIMEOUT = (15, 45)     # (연결 타임아웃, 읽기 타임아웃)
+UPLOAD_INTERVAL_SEC = 25  # 네이버 연속 등록 방지
+RETRY_WAIT_SEC = 30       # 게시 실패 시 재시도 대기
 
 HEADERS = {
     "User-Agent": (
@@ -69,35 +71,10 @@ HEADERS = {
         "Chrome/125.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Connection": "keep-alive",
 }
 
-# 🆕 세션 재사용
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-
 # ============================================
-# 🆕 재시도 래퍼
-# ============================================
-def http_get(url: str, params: dict = None) -> requests.Response:
-    """MOEL 서버가 불안정해서 여러 번 재시도"""
-    last_err = None
-    for attempt in range(1, HTTP_MAX_RETRIES + 1):
-        try:
-            r = SESSION.get(url, params=params, timeout=HTTP_TIMEOUT)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last_err = e
-            print(f"      ⚠️ HTTP 시도 {attempt}/{HTTP_MAX_RETRIES} 실패: {type(e).__name__}")
-            if attempt < HTTP_MAX_RETRIES:
-                print(f"      ⏳ {HTTP_RETRY_WAIT}초 후 재시도...")
-                time.sleep(HTTP_RETRY_WAIT)
-    raise last_err
-
-# ============================================
-# 🔧 상태 관리
+# 🔧 상태 관리 (중복 방지)
 # ============================================
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -117,11 +94,13 @@ def save_state(state: dict):
 # 🔧 인코딩·정돈 유틸
 # ============================================
 def naver_double_encode(text: str) -> str:
+    """네이버 카페 API 한글 깨짐 방지 (이중 URL 인코딩)"""
     if not text:
         return ""
     return quote(quote(text, safe=''), safe='')
 
 def to_html_entity(text: str) -> str:
+    """본문용 - 특수문자 HTML 엔티티 변환"""
     result = []
     for c in text:
         code = ord(c)
@@ -132,6 +111,7 @@ def to_html_entity(text: str) -> str:
     return ''.join(result)
 
 def sanitize(text: str) -> str:
+    """네이버 API 문제 특수문자 정리"""
     if not text:
         return ""
     text = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -141,46 +121,13 @@ def nl_to_br(text: str) -> str:
     return text.replace('\n', '<br>')
 
 def clean_title(text: str) -> str:
+    """제목의 탭/개행/과공백 정리"""
     if not text:
         return ""
     return re.sub(r'\s+', ' ', text).strip()
 
 # ============================================
-# 🆕 본문 줄바꿈 정돈
-# ============================================
-def tidy_body(text: str) -> str:
-    """본문의 이상한 줄바꿈을 다듬어 문장 단위로 자연스럽게"""
-    if not text:
-        return ""
-
-    one = re.sub(r'\s+', ' ', text.replace('\n', ' ')).strip()
-
-    # 한글 종결어미 + 마침표 뒤에서 개행 (뒤가 숫자면 개행 안 함 = 날짜 보호)
-    endings = ['습니다', '됩니다', '입니다', '있습니다', '없습니다',
-               '하였다', '되었다', '이다', '한다', '된다',
-               '다', '요', '함', '음', '임', '됨']
-    endings.sort(key=len, reverse=True)
-
-    for e in endings:
-        pattern = re.escape(e) + r'\.\s+(?=[^\d\s])'
-        one = re.sub(pattern, e + '.\n', one)
-
-    # 물음표/느낌표 뒤
-    one = re.sub(r'([!?])\s+(?=[^\d\s])', r'\1\n', one)
-
-    # 특정 키워드 앞 개행
-    one = re.sub(r'\s+(?=붙임)', '\n', one)
-    one = re.sub(r'\s+(?=공포\s*:)', '\n', one)
-    one = re.sub(r'\s+(?=시행\s*:)', '\n', one)
-    one = re.sub(r'\s+(?=\*\s)', '\n', one)
-
-    lines = [ln.strip() for ln in one.split('\n')]
-    lines = [ln for ln in lines if ln]
-
-    return '\n'.join(lines).strip()
-
-# ============================================
-# 🧹 본문 노이즈 제거
+# 🧹 본문 노이즈 제거 규칙
 # ============================================
 NOISE_KEYWORDS = [
     "홈", "으로 이동", "정보공개", "예산·법령정보",
@@ -195,20 +142,72 @@ NOISE_KEYWORDS = [
 ]
 
 def is_noise_line(line: str) -> bool:
+    """불필요한 UI/네비게이션 텍스트 판별"""
     s = line.strip()
     if not s or len(s) <= 1:
         return True
     for kw in NOISE_KEYWORDS:
         if s == kw:
             return True
+        # 아주 짧은 라인이 노이즈 키워드를 포함하면 제거
         if len(s) < 20 and kw in s:
             return True
     return False
 
 # ============================================
+# 🆕 잘못 끊어진 라인 재조립
+# ============================================
+def is_sentence_end(line: str) -> bool:
+    """
+    이 라인이 문장의 끝인지 판별.
+    문장 끝이 아니면 다음 라인과 이어붙여야 함.
+    """
+    if not line:
+        return True
+    last = line[-1]
+    # 문장 종결 부호로 끝나면 종결
+    if last in '.。!?"\'):]}」』':
+        # 단, "2026." "8." "1." 같은 숫자+마침표는 종결 아님
+        # (마지막 마침표 앞이 숫자면 날짜/번호 파편)
+        if last == '.' and len(line) >= 2 and line[-2].isdigit():
+            return False
+        return True
+    return False
+
+def merge_broken_lines(lines: list) -> list:
+    """
+    잘못 끊어진 라인들을 문장 단위로 다시 합침.
+    - 이전 라인이 문장 끝이 아니면 다음 라인을 이어붙임
+    - 특히 날짜 파편 (2026. / 8. / 1.) 을 붙여줌
+    """
+    if not lines:
+        return lines
+
+    merged = []
+    buf = ""
+    for line in lines:
+        if not buf:
+            buf = line
+            continue
+        # 이전 buf 가 문장 끝이 아니면 이어붙임
+        if not is_sentence_end(buf):
+            # 날짜 파편(숫자.) 다음에 오는 게 숫자.이면 공백 붙여서 연결
+            buf = buf + " " + line
+        else:
+            merged.append(buf)
+            buf = line
+    if buf:
+        merged.append(buf)
+    return merged
+
+# ============================================
 # 📥 목록 크롤링
 # ============================================
 def fetch_list(target: dict, keyword: str) -> list[dict]:
+    """
+    고용노동부 목록 페이지에서 '안전' 검색 결과 파싱
+    반환: [{seq, title, reg_date, view_url}, ...]
+    """
     params = {
         "searchType": "title",
         "searchWrd": keyword,
@@ -217,11 +216,13 @@ def fetch_list(target: dict, keyword: str) -> list[dict]:
     }
 
     print(f"\n📥 [{target['name']}] 목록 요청: {target['list_url']} (검색어={keyword})")
-    r = http_get(target['list_url'], params=params)   # 🆕 재시도 래퍼 사용
+    r = requests.get(target['list_url'], params=params, headers=HEADERS, timeout=30)
+    r.raise_for_status()
     r.encoding = r.apparent_encoding or 'utf-8'
 
     soup = BeautifulSoup(r.text, 'lxml')
 
+    # 목록 테이블 탐색
     table = (
         soup.select_one('table.board_list')
         or soup.select_one('div.board_list table')
@@ -247,6 +248,7 @@ def fetch_list(target: dict, keyword: str) -> list[dict]:
         if not title:
             continue
 
+        # 검색어 안 들어간 건 스킵
         if keyword not in title:
             continue
 
@@ -256,12 +258,14 @@ def fetch_list(target: dict, keyword: str) -> list[dict]:
         seq = None
         view_url = None
 
+        # 케이스 A: href에 이미 view URL
         if href and href not in ('#', 'javascript:;'):
             view_url = urljoin(target['list_url'], href)
             m = re.search(r'seq=(\d+)', view_url)
             if m:
                 seq = m.group(1)
 
+        # 케이스 B: onclick="fn_view('123')" 등
         if not seq and onclick:
             m = re.search(r"['\"](\d{3,})['\"]", onclick)
             if m:
@@ -278,6 +282,7 @@ def fetch_list(target: dict, keyword: str) -> list[dict]:
         if not seq or not view_url:
             continue
 
+        # 날짜 추출
         row_text = ' | '.join(td.get_text(' ', strip=True) for td in tds)
         date_match = re.search(r'20\d{2}[-.\/]\d{1,2}[-.\/]\d{1,2}', row_text)
         reg_date = date_match.group(0) if date_match else ""
@@ -293,9 +298,13 @@ def fetch_list(target: dict, keyword: str) -> list[dict]:
     return rows
 
 # ============================================
-# 📄 상세 - 메타테이블
+# 📄 상세 페이지 - 메타정보 추출
 # ============================================
 def extract_meta_table(soup: BeautifulSoup):
+    """
+    상세 페이지 상단의 메타 테이블(제목/유형/담당부서/등록일 등)에서
+    key-value 를 뽑고, 해당 테이블 요소를 반환.
+    """
     meta = {}
     target_table = None
     for table in soup.find_all('table'):
@@ -311,6 +320,7 @@ def extract_meta_table(soup: BeautifulSoup):
                 v = re.sub(r'\s+', ' ', td.get_text(' ', strip=True))
                 if k and v:
                     picked[k] = v
+        # '제목' 또는 '등록일' 이 있으면 메타테이블로 채택
         if any(key in picked for key in ('제목', '등록일', '담당부서', '유형')):
             meta = picked
             target_table = table
@@ -318,9 +328,13 @@ def extract_meta_table(soup: BeautifulSoup):
     return meta, target_table
 
 # ============================================
-# 📄 상세 - 본문
+# 📄 상세 페이지 - 본문 추출
 # ============================================
 def extract_body_text(soup: BeautifulSoup, meta_table) -> str:
+    """
+    본문 텍스트만 추출 (메타테이블·첨부영역·네비게이션 제외)
+    """
+    # 제거할 요소들
     for tag in soup.select(
         'header, footer, nav, script, style, aside, '
         '.snb, .lnb, .gnb, .location, .breadcrumb, '
@@ -328,12 +342,15 @@ def extract_body_text(soup: BeautifulSoup, meta_table) -> str:
     ):
         tag.decompose()
 
+    # 메타 테이블 제거
     if meta_table:
         meta_table.decompose()
 
+    # 첨부파일 영역은 별도로 처리하므로 본문에서는 제거
     for tag in soup.select('.file_list, .file_area, .attach, .attachment, .file, .filedown'):
         tag.decompose()
 
+    # 본문 컨테이너 후보
     candidates = [
         'div.board_view', 'div.view_cont', 'div.bbs_view',
         'div.view_area', 'div.cont_area', 'div.view_content',
@@ -354,6 +371,7 @@ def extract_body_text(soup: BeautifulSoup, meta_table) -> str:
 
     raw = body.get_text('\n', strip=True)
 
+    # 라인 단위 필터링 + 중복 제거
     lines = []
     seen = set()
     for line in raw.split('\n'):
@@ -365,14 +383,22 @@ def extract_body_text(soup: BeautifulSoup, meta_table) -> str:
         seen.add(line)
         lines.append(line)
 
+    # 🆕 잘못 끊어진 라인 재조립 (예: "2026.\n8.\n1.\n시행" → "2026. 8. 1. 시행")
+    lines = merge_broken_lines(lines)
+
     text = '\n'.join(lines)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 # ============================================
-# 📄 상세 - 첨부파일 (dedup)
+# 📄 상세 페이지 - 첨부파일 추출 (dedup)
 # ============================================
 def extract_attachments(soup: BeautifulSoup, base_url: str):
+    """
+    실제 다운로드 가능한 첨부파일만 추출 + 중복 제거.
+    "첨부" / "다운로드" / "바로보기" 같은 UI 라벨 링크는 제외.
+    파일명(확장자 포함)이 있는 링크만 채택.
+    """
     seen_urls = set()
     seen_names = set()
     result = []
@@ -385,15 +411,18 @@ def extract_attachments(soup: BeautifulSoup, base_url: str):
         if not text:
             continue
 
+        # UI 라벨 링크 제외
         if text in ("첨부", "첨부파일", "다운로드", "바로보기", "미리보기", "보기"):
             continue
 
+        # 파일 확장자가 텍스트에 없으면 UI 링크로 간주
         if not re.search(
             r'\.(pdf|hwp|hwpx|doc|docx|xls|xlsx|ppt|pptx|zip|jpg|jpeg|png|gif|txt)(\s|$|\))',
             text, re.I
         ):
             continue
 
+        # 다운로드 URL 확정
         file_url = None
         if href and ('download' in href.lower() or 'fileDown' in href or 'file' in href.lower()):
             file_url = urljoin(base_url, href)
@@ -416,18 +445,27 @@ def extract_attachments(soup: BeautifulSoup, base_url: str):
     return result
 
 # ============================================
-# 📄 상세 통합
+# 📄 상세 페이지 크롤링 (통합)
 # ============================================
 def fetch_detail(view_url: str) -> dict:
+    """
+    상세 페이지에서 메타정보 + 본문 + 첨부파일 각각 추출.
+    반환: {'meta': {...}, 'body': str, 'attachments': [(name, url), ...]}
+    """
     try:
-        r = http_get(view_url)   # 🆕 재시도 래퍼 사용
+        r = requests.get(view_url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
         r.encoding = r.apparent_encoding or 'utf-8'
         soup = BeautifulSoup(r.text, 'lxml')
 
+        # 1) 첨부파일 (먼저 뽑기 - 본문에서 지우기 전에)
         attachments = extract_attachments(soup, view_url)
+
+        # 2) 메타정보 + 메타테이블 참조
         meta, meta_table = extract_meta_table(soup)
+
+        # 3) 본문 (메타·첨부 제거 후)
         body = extract_body_text(soup, meta_table)
-        body = tidy_body(body)   # 🆕 본문 정돈
 
         return {
             "meta": meta,
@@ -449,6 +487,7 @@ def build_content(item: dict, target: dict, detail: dict) -> str:
     body = detail.get("body", "")
     attachments = detail.get("attachments", [])
 
+    # 메타정보 우선순위대로 출력
     meta_order = ["제목", "유형", "담당부서", "전화번호", "담당자", "등록일"]
     meta_lines = []
     for key in meta_order:
@@ -458,6 +497,7 @@ def build_content(item: dict, target: dict, detail: dict) -> str:
         if k not in meta_order and v:
             meta_lines.append(f"<b>{k}:</b> {v}")
 
+    # 폴백: 메타 없으면 목록에서 뽑은 값 사용
     if not meta_lines:
         meta_lines.append(f"<b>제목:</b> {item['title']}")
         if item.get('reg_date'):
@@ -476,6 +516,7 @@ def build_content(item: dict, target: dict, detail: dict) -> str:
         f"<p>{nl_to_br(body) if body else '(본문을 불러오지 못했습니다. 아래 원문 링크에서 확인해 주세요.)'}</p>",
     ]
 
+    # 첨부파일
     if attachments:
         parts.append("<hr>")
         parts.append(f"<p><b>📎 첨부파일 ({len(attachments)}건)</b></p>")
@@ -511,6 +552,7 @@ def get_access_token() -> str:
     return token
 
 def post_to_cafe(token: str, subject: str, content: str) -> requests.Response:
+    """네이버 카페 글 등록 (urlencoded + 이중 인코딩)"""
     url = f"https://openapi.naver.com/v1/cafe/{CAFE_ID}/menu/{MENU_ID}/articles"
     headers = {
         "Authorization": f"Bearer {token}",
@@ -525,6 +567,10 @@ def post_to_cafe(token: str, subject: str, content: str) -> requests.Response:
     return r
 
 def post_with_retry(token: str, subject: str, content: str, max_attempts: int = 2):
+    """
+    실패 시 재시도 (네이버 API의 일시적 999 오류 대응).
+    반환: (success: bool, article_url: str, last_error: str)
+    """
     last_err = ""
     for attempt in range(1, max_attempts + 1):
         try:
@@ -560,10 +606,11 @@ def run():
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst)
     print("=" * 60)
-    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v2.3)")
+    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v2)")
     print(f"⏰ {now.strftime('%Y-%m-%d %H:%M KST')}")
     print("=" * 60)
 
+    # 환경변수 체크
     missing = [k for k, v in {
         "NAVER_CLIENT_ID": CLIENT_ID,
         "NAVER_CLIENT_SECRET": CLIENT_SECRET,
@@ -576,6 +623,7 @@ def run():
     state = load_state()
     print(f"📚 기존 게시 이력: {sum(len(v) for v in state.values())}건")
 
+    # 토큰
     print("\n🔑 액세스 토큰 발급...")
     token = get_access_token()
     print("   ✅ 토큰 OK")
@@ -594,10 +642,12 @@ def run():
             print(f"   ❌ 목록 실패: {e}")
             continue
 
+        # 신규만 필터
         new_items = [it for it in items if it['seq'] not in state[tag]]
         print(f"   🆕 신규: {len(new_items)}건 / 전체: {len(items)}건")
         total_new += len(new_items)
 
+        # 오래된 것부터 등록 (목록은 최신순 → 역순)
         for idx, item in enumerate(reversed(new_items)):
             print(f"\n   ▶ [{idx+1}/{len(new_items)}] {item['title'][:60]}")
             print(f"      URL: {item['view_url']}")
@@ -618,16 +668,19 @@ def run():
                 print(f"      ❌ 최종 실패: {err}")
                 total_fail += 1
 
+            # 다음 글까지 대기
             if idx < len(new_items) - 1:
                 print(f"      ⏳ {UPLOAD_INTERVAL_SEC}초 대기...")
                 time.sleep(UPLOAD_INTERVAL_SEC)
 
+        # 카테고리 간에도 잠깐 쉼
         time.sleep(5)
 
     print("\n" + "=" * 60)
     print(f"🎉 완료 — 신규감지: {total_new} · 성공: {total_ok} · 실패: {total_fail}")
     print("=" * 60)
 
+    # 신규 감지는 있었는데 전부 실패한 경우만 CI 실패
     if total_new > 0 and total_ok == 0 and total_fail > 0:
         exit(1)
 
