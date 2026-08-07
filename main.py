@@ -1,6 +1,6 @@
 # ============================================
 # 🏭 고용노동부 안전 관련 공고 → 네이버 카페 자동 게시
-# GitHub Actions 자동 실행 버전 (v2.2 - 본문 줄바꿈 정돈)
+# GitHub Actions 자동 실행 버전 (v2.3 - 네트워크 재시도 + 본문 정돈)
 # ============================================
 
 import os
@@ -57,6 +57,11 @@ STATE_FILE = STATE_DIR / "posted.json"
 UPLOAD_INTERVAL_SEC = 25
 RETRY_WAIT_SEC = 30
 
+# 🆕 MOEL 서버 요청 재시도 설정
+HTTP_MAX_RETRIES = 4        # 최대 4번 시도
+HTTP_RETRY_WAIT = 15        # 실패 시 15초 대기
+HTTP_TIMEOUT = (15, 45)     # (연결 타임아웃, 읽기 타임아웃)
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -64,7 +69,32 @@ HEADERS = {
         "Chrome/125.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
 }
+
+# 🆕 세션 재사용
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+# ============================================
+# 🆕 재시도 래퍼
+# ============================================
+def http_get(url: str, params: dict = None) -> requests.Response:
+    """MOEL 서버가 불안정해서 여러 번 재시도"""
+    last_err = None
+    for attempt in range(1, HTTP_MAX_RETRIES + 1):
+        try:
+            r = SESSION.get(url, params=params, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_err = e
+            print(f"      ⚠️ HTTP 시도 {attempt}/{HTTP_MAX_RETRIES} 실패: {type(e).__name__}")
+            if attempt < HTTP_MAX_RETRIES:
+                print(f"      ⏳ {HTTP_RETRY_WAIT}초 후 재시도...")
+                time.sleep(HTTP_RETRY_WAIT)
+    raise last_err
 
 # ============================================
 # 🔧 상태 관리
@@ -116,45 +146,34 @@ def clean_title(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 # ============================================
-# 🆕 본문 줄바꿈 정돈 (핵심 추가 함수)
+# 🆕 본문 줄바꿈 정돈
 # ============================================
 def tidy_body(text: str) -> str:
-    """
-    본문의 이상한 줄바꿈을 다듬어 문장 단위로 자연스럽게 만든다.
-    - 날짜 파편(2026.\n8.\n1.) → 한 줄로 병합
-    - 문장 중간에 끊긴 짧은 조각들 → 앞줄에 붙임
-    - 문장이 끝난 곳(다. / 요. / 임. / 함. / 음. / 됨. / 이다. / 습니다. / ! / ?)에서만 개행
-    """
+    """본문의 이상한 줄바꿈을 다듬어 문장 단위로 자연스럽게"""
     if not text:
         return ""
 
-    # 1) 모든 줄을 하나로 이어붙임
     one = re.sub(r'\s+', ' ', text.replace('\n', ' ')).strip()
 
-    # 2) 문장 끝 표시 뒤에 개행 마커 삽입
-    #    한글 종결어미 + 마침표 뒤
+    # 한글 종결어미 + 마침표 뒤에서 개행 (뒤가 숫자면 개행 안 함 = 날짜 보호)
     endings = ['습니다', '됩니다', '입니다', '있습니다', '없습니다',
                '하였다', '되었다', '이다', '한다', '된다',
                '다', '요', '함', '음', '임', '됨']
-    # 긴 것부터 매칭 (다 보다 습니다 가 먼저)
     endings.sort(key=len, reverse=True)
 
     for e in endings:
-        # "종결어미." + 공백 + 다음글자  →  "종결어미.\n다음글자"
-        # 단, 뒤가 숫자(날짜 파편)면 개행하지 않음
         pattern = re.escape(e) + r'\.\s+(?=[^\d\s])'
         one = re.sub(pattern, e + '.\n', one)
 
-    # 3) 물음표/느낌표 뒤 개행 (뒤가 숫자가 아닐 때만)
+    # 물음표/느낌표 뒤
     one = re.sub(r'([!?])\s+(?=[^\d\s])', r'\1\n', one)
 
-    # 4) 특정 키워드 앞에서 개행 (붙임, 공포:, 시행:, * 로 시작하는 라인 등)
+    # 특정 키워드 앞 개행
     one = re.sub(r'\s+(?=붙임)', '\n', one)
     one = re.sub(r'\s+(?=공포\s*:)', '\n', one)
     one = re.sub(r'\s+(?=시행\s*:)', '\n', one)
     one = re.sub(r'\s+(?=\*\s)', '\n', one)
 
-    # 5) 각 줄 트리밍
     lines = [ln.strip() for ln in one.split('\n')]
     lines = [ln for ln in lines if ln]
 
@@ -198,8 +217,7 @@ def fetch_list(target: dict, keyword: str) -> list[dict]:
     }
 
     print(f"\n📥 [{target['name']}] 목록 요청: {target['list_url']} (검색어={keyword})")
-    r = requests.get(target['list_url'], params=params, headers=HEADERS, timeout=30)
-    r.raise_for_status()
+    r = http_get(target['list_url'], params=params)   # 🆕 재시도 래퍼 사용
     r.encoding = r.apparent_encoding or 'utf-8'
 
     soup = BeautifulSoup(r.text, 'lxml')
@@ -402,17 +420,14 @@ def extract_attachments(soup: BeautifulSoup, base_url: str):
 # ============================================
 def fetch_detail(view_url: str) -> dict:
     try:
-        r = requests.get(view_url, headers=HEADERS, timeout=30)
-        r.raise_for_status()
+        r = http_get(view_url)   # 🆕 재시도 래퍼 사용
         r.encoding = r.apparent_encoding or 'utf-8'
         soup = BeautifulSoup(r.text, 'lxml')
 
         attachments = extract_attachments(soup, view_url)
         meta, meta_table = extract_meta_table(soup)
         body = extract_body_text(soup, meta_table)
-
-        # 🆕 줄바꿈 정돈
-        body = tidy_body(body)
+        body = tidy_body(body)   # 🆕 본문 정돈
 
         return {
             "meta": meta,
@@ -545,7 +560,7 @@ def run():
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst)
     print("=" * 60)
-    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v2.2)")
+    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v2.3)")
     print(f"⏰ {now.strftime('%Y-%m-%d %H:%M KST')}")
     print("=" * 60)
 
