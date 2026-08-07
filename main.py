@@ -1,6 +1,6 @@
 # ============================================
 # 🏭 고용노동부 안전 관련 공고 → 네이버 카페 자동 게시
-# GitHub Actions 자동 실행 버전 (v2 - 본문 정돈 + 첨부 dedup)
+# GitHub Actions 자동 실행 버전 (v2.1 - 본문 문장병합 추가)
 #
 # 대상:
 #   1) 입법·행정예고 (lawmaking)
@@ -155,52 +155,6 @@ def is_noise_line(line: str) -> bool:
     return False
 
 # ============================================
-# 🆕 잘못 끊어진 라인 재조립
-# ============================================
-def is_sentence_end(line: str) -> bool:
-    """
-    이 라인이 문장의 끝인지 판별.
-    문장 끝이 아니면 다음 라인과 이어붙여야 함.
-    """
-    if not line:
-        return True
-    last = line[-1]
-    # 문장 종결 부호로 끝나면 종결
-    if last in '.。!?"\'):]}」』':
-        # 단, "2026." "8." "1." 같은 숫자+마침표는 종결 아님
-        # (마지막 마침표 앞이 숫자면 날짜/번호 파편)
-        if last == '.' and len(line) >= 2 and line[-2].isdigit():
-            return False
-        return True
-    return False
-
-def merge_broken_lines(lines: list) -> list:
-    """
-    잘못 끊어진 라인들을 문장 단위로 다시 합침.
-    - 이전 라인이 문장 끝이 아니면 다음 라인을 이어붙임
-    - 특히 날짜 파편 (2026. / 8. / 1.) 을 붙여줌
-    """
-    if not lines:
-        return lines
-
-    merged = []
-    buf = ""
-    for line in lines:
-        if not buf:
-            buf = line
-            continue
-        # 이전 buf 가 문장 끝이 아니면 이어붙임
-        if not is_sentence_end(buf):
-            # 날짜 파편(숫자.) 다음에 오는 게 숫자.이면 공백 붙여서 연결
-            buf = buf + " " + line
-        else:
-            merged.append(buf)
-            buf = line
-    if buf:
-        merged.append(buf)
-    return merged
-
-# ============================================
 # 📥 목록 크롤링
 # ============================================
 def fetch_list(target: dict, keyword: str) -> list[dict]:
@@ -333,6 +287,7 @@ def extract_meta_table(soup: BeautifulSoup):
 def extract_body_text(soup: BeautifulSoup, meta_table) -> str:
     """
     본문 텍스트만 추출 (메타테이블·첨부영역·네비게이션 제외)
+    + 잘못 끊어진 라인을 문장 단위로 재결합
     """
     # 제거할 요소들
     for tag in soup.select(
@@ -383,8 +338,35 @@ def extract_body_text(soup: BeautifulSoup, meta_table) -> str:
         seen.add(line)
         lines.append(line)
 
-    # 🆕 잘못 끊어진 라인 재조립 (예: "2026.\n8.\n1.\n시행" → "2026. 8. 1. 시행")
-    lines = merge_broken_lines(lines)
+    # 🆕 잘못 끊어진 짧은 라인들을 문장 단위로 재결합
+    #   예) "2026." + "8." + "1." + "시행"  →  "2026. 8. 1. 시행"
+    #   규칙: 이전 라인이 문장종결부호(.。!? 등)로 안 끝나면 다음 라인과 이어붙임.
+    #         단, "2026." 처럼 숫자+마침표는 종결로 안 봄.
+    merged = []
+    buf = ""
+    for line in lines:
+        if not buf:
+            buf = line
+            continue
+
+        last = buf[-1]
+        is_end = last in '.。!?"\'):]}」』…'
+        # 숫자 뒤 마침표는 종결 아님 (날짜/조항번호)
+        if last == '.' and len(buf) >= 2 and buf[-2].isdigit():
+            is_end = False
+        # 한 글자짜리 조각(예: "8.")도 종결 아님
+        if len(buf) <= 3 and buf.endswith('.'):
+            is_end = False
+
+        if is_end:
+            merged.append(buf)
+            buf = line
+        else:
+            buf = buf + " " + line
+
+    if buf:
+        merged.append(buf)
+    lines = merged
 
     text = '\n'.join(lines)
     text = re.sub(r'\n{3,}', '\n\n', text)
@@ -606,7 +588,7 @@ def run():
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst)
     print("=" * 60)
-    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v2)")
+    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v2.1)")
     print(f"⏰ {now.strftime('%Y-%m-%d %H:%M KST')}")
     print("=" * 60)
 
