@@ -1,19 +1,6 @@
 # ============================================
 # 🏭 고용노동부 안전 관련 공고 → 네이버 카페 자동 게시
-# GitHub Actions 자동 실행 버전 (v2.1 - 본문 가독성 개선)
-#
-# 대상:
-#   1) 입법·행정예고 (lawmaking)
-#   2) 훈령·예규·고시 (instruction)
-#   3) 최근 제·개정 법령 (revision)
-# 검색어: "안전"
-#
-# 🆕 v2 대비 변경점:
-#   - 잘못 끊어진 문장 재조립 (짧은 조각들 합침)
-#   - 날짜 파편 병합 (2026.\n5.\n29. → 2026. 5. 29.)
-#   - 메타테이블 값이 본문에 재등장하면 제거
-#   - 하단 관련목록 트림
-#   - 문장 단위(마침표+공백) 자연스러운 줄바꿈
+# GitHub Actions 자동 실행 버전 (v2.2 - 본문 줄바꿈 정돈)
 # ============================================
 
 import os
@@ -129,7 +116,52 @@ def clean_title(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 # ============================================
-# 🧹 본문 노이즈 제거 규칙
+# 🆕 본문 줄바꿈 정돈 (핵심 추가 함수)
+# ============================================
+def tidy_body(text: str) -> str:
+    """
+    본문의 이상한 줄바꿈을 다듬어 문장 단위로 자연스럽게 만든다.
+    - 날짜 파편(2026.\n8.\n1.) → 한 줄로 병합
+    - 문장 중간에 끊긴 짧은 조각들 → 앞줄에 붙임
+    - 문장이 끝난 곳(다. / 요. / 임. / 함. / 음. / 됨. / 이다. / 습니다. / ! / ?)에서만 개행
+    """
+    if not text:
+        return ""
+
+    # 1) 모든 줄을 하나로 이어붙임
+    one = re.sub(r'\s+', ' ', text.replace('\n', ' ')).strip()
+
+    # 2) 문장 끝 표시 뒤에 개행 마커 삽입
+    #    한글 종결어미 + 마침표 뒤
+    endings = ['습니다', '됩니다', '입니다', '있습니다', '없습니다',
+               '하였다', '되었다', '이다', '한다', '된다',
+               '다', '요', '함', '음', '임', '됨']
+    # 긴 것부터 매칭 (다 보다 습니다 가 먼저)
+    endings.sort(key=len, reverse=True)
+
+    for e in endings:
+        # "종결어미." + 공백 + 다음글자  →  "종결어미.\n다음글자"
+        # 단, 뒤가 숫자(날짜 파편)면 개행하지 않음
+        pattern = re.escape(e) + r'\.\s+(?=[^\d\s])'
+        one = re.sub(pattern, e + '.\n', one)
+
+    # 3) 물음표/느낌표 뒤 개행 (뒤가 숫자가 아닐 때만)
+    one = re.sub(r'([!?])\s+(?=[^\d\s])', r'\1\n', one)
+
+    # 4) 특정 키워드 앞에서 개행 (붙임, 공포:, 시행:, * 로 시작하는 라인 등)
+    one = re.sub(r'\s+(?=붙임)', '\n', one)
+    one = re.sub(r'\s+(?=공포\s*:)', '\n', one)
+    one = re.sub(r'\s+(?=시행\s*:)', '\n', one)
+    one = re.sub(r'\s+(?=\*\s)', '\n', one)
+
+    # 5) 각 줄 트리밍
+    lines = [ln.strip() for ln in one.split('\n')]
+    lines = [ln for ln in lines if ln]
+
+    return '\n'.join(lines).strip()
+
+# ============================================
+# 🧹 본문 노이즈 제거
 # ============================================
 NOISE_KEYWORDS = [
     "홈", "으로 이동", "정보공개", "예산·법령정보",
@@ -153,96 +185,6 @@ def is_noise_line(line: str) -> bool:
         if len(s) < 20 and kw in s:
             return True
     return False
-
-# ============================================
-# 🆕 본문 정돈 (문장 재조립 + 줄바꿈)
-# ============================================
-def reflow_body(text: str, meta: dict = None) -> str:
-    """
-    깨진 줄바꿈으로 조각난 본문을 문장 단위로 재조립하고,
-    가독성 있게 다시 줄바꿈한다.
-    """
-    if not text:
-        return ""
-
-    # 1) 모든 줄을 공백 하나로 이어붙임 (일단 한 줄로)
-    one_line = re.sub(r'\s+', ' ', text.replace('\n', ' ')).strip()
-
-    # 2) 메타테이블 값이 본문 앞에 붙어있으면 제거
-    #    ex) "고용노동부 제목 XXX 유형 YYY 담당부서 ZZZ ... 등록일 2026-07-30 실제본문..."
-    #    "등록일 YYYY-MM-DD" 패턴을 찾아 그 뒤부터 실제 본문으로 간주
-    m = re.search(r'등록일\s*20\d{2}[-.\/]\d{1,2}[-.\/]\d{1,2}\s*', one_line)
-    if m:
-        one_line = one_line[m.end():].strip()
-
-    # 3) 메타값 자체도 본문에 다시 나오면 제거 (예: "고용노동부" 로 시작하는 경우)
-    if meta:
-        for key in ("제목", "담당부서", "담당자", "전화번호", "유형"):
-            v = meta.get(key, "")
-            if v and len(v) >= 4 and v in one_line:
-                # 본문 앞쪽 200자 이내에서 반복될 때만 제거
-                idx = one_line.find(v)
-                if idx < 200:
-                    one_line = (one_line[:idx] + one_line[idx + len(v):]).strip()
-
-    # 4) 날짜 파편 병합: "2026. 5. 29." 처럼 사이 공백만 있으면 그대로 두고,
-    #    "2026 . 5 . 29 ." 같이 벌어진 건 붙임
-    one_line = re.sub(r'(\d{4})\s*\.\s*(\d{1,2})\s*\.\s*(\d{1,2})\s*\.', r'\1. \2. \3.', one_line)
-    one_line = re.sub(r'(\d{4})\s*\.\s*(\d{1,2})\s*\.', r'\1. \2.', one_line)
-
-    # 5) 하단 관련목록 트림: "○○○ 일부개정령" / "○○○ 일부 개정안" 같은
-    #    별도 게시글 제목들이 본문 끝에 붙어있으면 제거
-    #    (매우 보수적으로: 마지막 문장이 매우 짧고 "일부개정" / "개정안" / "고시" 로 끝나면 제거)
-    tail_patterns = [
-        r'\s*[^.。!?]{5,80}(일부개정령|일부 개정안|일부개정안|일부개정)\s*$',
-        r'\s*[^.。!?]{5,80}\s(고시|훈령|예규)\s*$',
-    ]
-    for _ in range(5):  # 최대 5개 꼬리 반복 제거
-        removed = False
-        for pat in tail_patterns:
-            new = re.sub(pat, '', one_line)
-            if new != one_line:
-                one_line = new.strip()
-                removed = True
-                break
-        if not removed:
-            break
-
-    # 6) 문장 단위 줄바꿈
-    #    - 한글/닫는괄호 뒤 마침표 + 공백 → 개행
-    #    - 물음표/느낌표 + 공백 → 개행
-    #    - 단, 숫자 마침표(2026. / 5. / 29.)는 제외 : 뒤 문자가 숫자면 개행 안 함
-    text = one_line
-
-    # 마침표 뒤 개행: 앞이 한글/닫는괄호/영문이고, 뒤가 공백 다음에 숫자가 아닌 경우
-    text = re.sub(r'(?<=[가-힣\)\]
-A-Za-z])\.\s+(?=[^\d\s])', '.\n', text)
-    # 물음표/느낌표 뒤 개행
-    text = re.sub(r'([!?])\s+(?=\S)', r'\1\n', text)
-    # "~다.", "~함.", "~음.", "~임.", "~됨." 뒤에도 확실히 개행 (한글 종결어미)
-    text = re.sub(r'(다|함|음|임|됨|요)\.\s+', r'\1.\n', text)
-
-    # 7) 특정 라벨 앞에서 개행 (붙임, 공포:, 시행:, * 등)
-    text = re.sub(r'\s+(?=(붙임|공포\s*:|시행\s*:|\*\s))', '\n', text)
-
-    # 8) 번호매김 앞 개행 (1. / 2. / 가. / 나.)
-    text = re.sub(r'\s+(?=\d{1,2}\.\s[가-힣A-Za-z])', '\n', text)
-    text = re.sub(r'\s+(?=[가-힣]\.\s[가-힣A-Za-z])', '\n', text)
-
-    # 9) 각 줄 트림 및 빈줄 정리
-    lines = [ln.strip() for ln in text.split('\n')]
-    lines = [ln for ln in lines if ln]
-
-    # 10) 너무 짧은 파편(1~2글자) 이 앞뒤 라인에 붙어야 자연스러운 경우 병합
-    merged = []
-    for ln in lines:
-        if merged and len(ln) <= 3 and re.match(r'^[\d\.\-]+$', ln):
-            # 숫자/기호만 있는 짧은 라인 → 앞줄에 병합
-            merged[-1] = merged[-1] + ' ' + ln
-        else:
-            merged.append(ln)
-
-    return '\n'.join(merged).strip()
 
 # ============================================
 # 📥 목록 크롤링
@@ -469,8 +411,8 @@ def fetch_detail(view_url: str) -> dict:
         meta, meta_table = extract_meta_table(soup)
         body = extract_body_text(soup, meta_table)
 
-        # 🆕 본문 재조립·줄바꿈 정돈
-        body = reflow_body(body, meta=meta)
+        # 🆕 줄바꿈 정돈
+        body = tidy_body(body)
 
         return {
             "meta": meta,
@@ -508,21 +450,6 @@ def build_content(item: dict, target: dict, detail: dict) -> str:
 
     meta_html = "<br>".join(meta_lines)
 
-    # 🆕 본문: 문단 단위 <p> + 줄바꿈 <br>
-    body_html = ""
-    if body:
-        # 빈 줄 기준으로 문단 분리 (없으면 전체가 한 문단)
-        paras = re.split(r'\n\s*\n', body)
-        html_paras = []
-        for p in paras:
-            p = p.strip()
-            if not p:
-                continue
-            html_paras.append(f"<p>{nl_to_br(p)}</p>")
-        body_html = "\n".join(html_paras)
-    else:
-        body_html = "<p>(본문을 불러오지 못했습니다. 아래 원문 링크에서 확인해 주세요.)</p>"
-
     parts = [
         f"<h3>{item['title']}</h3>",
         f"<p><b>📂 구분:</b> 고용노동부 · {target['name']}</p>",
@@ -531,7 +458,7 @@ def build_content(item: dict, target: dict, detail: dict) -> str:
         f"<p>{meta_html}</p>",
         "<hr>",
         "<p><b>📄 본문</b></p>",
-        body_html,
+        f"<p>{nl_to_br(body) if body else '(본문을 불러오지 못했습니다. 아래 원문 링크에서 확인해 주세요.)'}</p>",
     ]
 
     if attachments:
@@ -618,7 +545,7 @@ def run():
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst)
     print("=" * 60)
-    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v2.1)")
+    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v2.2)")
     print(f"⏰ {now.strftime('%Y-%m-%d %H:%M KST')}")
     print("=" * 60)
 
