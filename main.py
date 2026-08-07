@@ -1,6 +1,6 @@
 # ============================================
 # 🏭 고용노동부 안전 관련 공고 → 네이버 카페 자동 게시
-# GitHub Actions 자동 실행 버전 (v3.1 - 원본 유지 + 최소 안전 보완)
+# GitHub Actions 자동 실행 버전 (v2.1 - 본문 가독성 개선)
 #
 # 대상:
 #   1) 입법·행정예고 (lawmaking)
@@ -8,15 +8,16 @@
 #   3) 최근 제·개정 법령 (revision)
 # 검색어: "안전"
 #
-# 🆕 v3 대비 변경점 (최소):
-#   1) sys.stdout 실시간 flush (GitHub Actions 로그 실시간 표시)
-#   2) http_get() 헬퍼로 네트워크 일시 장애 시 자동 재시도
-#      → 정상 상황에서는 원본과 100% 동일 동작
+# 🆕 v2 대비 변경점:
+#   - 잘못 끊어진 문장 재조립 (짧은 조각들 합침)
+#   - 날짜 파편 병합 (2026.\n5.\n29. → 2026. 5. 29.)
+#   - 메타테이블 값이 본문에 재등장하면 제거
+#   - 하단 관련목록 트림
+#   - 문장 단위(마침표+공백) 자연스러운 줄바꿈
 # ============================================
 
 import os
 import re
-import sys
 import json
 import time
 import requests
@@ -24,12 +25,6 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, urljoin
 from bs4 import BeautifulSoup
-
-# 🆕 실시간 로그 출력 (GitHub Actions에서 진행상황 즉시 확인용)
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-except Exception:
-    pass
 
 # ============================================
 # ⚙️ 환경변수
@@ -85,41 +80,6 @@ HEADERS = {
 }
 
 # ============================================
-# 🌐 HTTP GET (원본 requests.get 대체 - 재시도만 추가)
-# ============================================
-def http_get(url: str, params: dict = None, timeout: int = 30) -> requests.Response:
-    """
-    원본의 requests.get(url, params=params, headers=HEADERS, timeout=30) 과 동일하지만
-    ConnectTimeout/ReadTimeout/ConnectionError 시 최대 3회까지 재시도 (2초 → 5초 대기).
-    정상 응답 시에는 원본과 100% 동일한 Response 반환.
-    """
-    last_err = None
-    waits = [2, 5]  # 재시도 사이 대기(초)
-    max_attempts = 3
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
-            r.raise_for_status()
-            return r
-        except (requests.exceptions.ConnectTimeout,
-                requests.exceptions.ReadTimeout,
-                requests.exceptions.ConnectionError) as e:
-            last_err = e
-            if attempt < max_attempts:
-                wait = waits[attempt - 1]
-                print(f"      ⚠️ 네트워크 오류 (시도 {attempt}/{max_attempts}): {type(e).__name__} → {wait}초 후 재시도")
-                time.sleep(wait)
-            else:
-                print(f"      ❌ 네트워크 오류 최종 실패 (시도 {attempt}/{max_attempts}): {type(e).__name__}")
-        except requests.exceptions.HTTPError as e:
-            # HTTP 4xx/5xx 는 원본과 동일하게 즉시 예외 raise
-            raise
-
-    # 모든 재시도 실패 → 예외 raise (원본과 동일 흐름)
-    raise last_err
-
-# ============================================
 # 🔧 상태 관리
 # ============================================
 def load_state() -> dict:
@@ -140,32 +100,16 @@ def save_state(state: dict):
 # 🔧 인코딩·정돈 유틸
 # ============================================
 def naver_double_encode(text: str) -> str:
-    """제목 - 이중 URL 인코딩"""
     if not text:
         return ""
     return quote(quote(text, safe=''), safe='')
 
-# ⚠️ HTML 태그 보존을 위한 화이트리스트
-# 태그·속성 문자는 엔티티화하지 않고 그대로 두어 하이퍼링크가 살아있게 함
-_HTML_SAFE_CHARS = set(
-    "<>\"'/=&; \t\n\r"
-    "abcdefghijklmnopqrstuvwxyz"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "0123456789"
-    "-_.~:!@#$%^&*()+[]{}|,?"
-)
-
 def to_html_entity(text: str) -> str:
-    """
-    본문용 - 한글/유니코드 문자만 엔티티화.
-    HTML 태그 관련 문자(<>, 따옴표, /, = 등)는 보존해서 링크가 살아있게 함.
-    """
     result = []
     for c in text:
-        if c in _HTML_SAFE_CHARS:
-            result.append(c)
-        elif ord(c) > 127:
-            result.append(f"&#{ord(c)};")
+        code = ord(c)
+        if code > 127 or c in '%&=?#':
+            result.append(f"&#{code};")
         else:
             result.append(c)
     return ''.join(result)
@@ -176,73 +120,16 @@ def sanitize(text: str) -> str:
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     return text.strip()
 
+def nl_to_br(text: str) -> str:
+    return text.replace('\n', '<br>')
+
 def clean_title(text: str) -> str:
     if not text:
         return ""
     return re.sub(r'\s+', ' ', text).strip()
 
 # ============================================
-# ✂️ 본문 가독성 향상
-# ============================================
-def prettify_body(text: str) -> str:
-    """
-    본문 텍스트를 문장 단위로 자연스럽게 줄바꿈하여 가독성 향상.
-    - 마침표/물음표/느낌표 뒤에서 문장 나눔
-    - 항목 구분(*, -, ·, 붙임, 시행, 공포 등) 앞에서 나눔
-    - 문단 간 빈 줄 삽입
-    """
-    if not text:
-        return ""
-
-    # 1) 여러 줄을 문단 단위로 분리 (빈 줄 = 문단 경계)
-    paragraphs = re.split(r'\n\s*\n', text)
-
-    processed = []
-    for para in paragraphs:
-        # 한 줄로 합침 (문단 내부)
-        one = re.sub(r'\s+', ' ', para).strip()
-        if not one:
-            continue
-
-        # 2) 문장 끝(마침표/? / !) 뒤에 개행
-        one = re.sub(r'(?<=[.!?])\s+(?=\S)', '\n', one)
-
-        # 3) 한글 종결어미 뒤에도 개행 (다./요./임./음. 등이 이미 위에서 처리됨)
-
-        # 4) 특정 키워드 앞에서 개행 (붙임, 공포, 시행, * 등)
-        one = re.sub(r'\s+(?=(붙임|공포\s*:|시행\s*:|\*\s|-\s|·\s))', '\n', one)
-
-        # 5) 번호매김 (1., 2., 가., 나. 등) 앞에서 개행
-        one = re.sub(r'\s+(?=\d{1,2}\.\s)', '\n', one)
-        one = re.sub(r'\s+(?=[가-힣]\.\s)', '\n', one)
-
-        processed.append(one.strip())
-
-    # 문단 사이는 빈 줄
-    return '\n\n'.join(processed)
-
-def text_to_html(text: str) -> str:
-    """
-    일반 텍스트 → HTML.
-    - 문단(빈 줄 기준) 단위로 <p>...</p>
-    - 문단 내부 줄바꿈은 <br>
-    """
-    if not text:
-        return ""
-    paragraphs = re.split(r'\n\s*\n', text.strip())
-    html_paras = []
-    for p in paragraphs:
-        p = p.strip()
-        if not p:
-            continue
-        # HTML 특수문자 이스케이프 (본문의 <, > 문자가 태그로 오인되지 않게)
-        p = p.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        p = p.replace('\n', '<br>')
-        html_paras.append(f"<p>{p}</p>")
-    return '\n'.join(html_paras)
-
-# ============================================
-# 🧹 본문 노이즈 제거
+# 🧹 본문 노이즈 제거 규칙
 # ============================================
 NOISE_KEYWORDS = [
     "홈", "으로 이동", "정보공개", "예산·법령정보",
@@ -253,32 +140,109 @@ NOISE_KEYWORDS = [
     "이 누리집은", "공식 누리집", "누리집 안내지도",
     "통합검색", "최근검색어", "검색어 자동완성",
     "상단으로 이동", "국민이 주인인 나라", "함께 행복한 대한민국",
-    "국민 누구나 원하는", "역량을 발휘하는 나라",
-    "일자리에서", "마음껏",
-]
-
-# 라인에 포함되면 무조건 제거하는 슬로건 (부분일치)
-SLOGAN_FRAGMENTS = [
-    "국민 누구나 원하는 일자리",
-    "역량을 발휘하는 나라",
-    "함께 행복한 대한민국",
-    "국민이 주인인 나라",
+    "국민 누구나 원하는",
 ]
 
 def is_noise_line(line: str) -> bool:
     s = line.strip()
     if not s or len(s) <= 1:
         return True
-    # 슬로건 조각 포함 → 무조건 제거
-    for frag in SLOGAN_FRAGMENTS:
-        if frag in s:
-            return True
     for kw in NOISE_KEYWORDS:
         if s == kw:
             return True
         if len(s) < 20 and kw in s:
             return True
     return False
+
+# ============================================
+# 🆕 본문 정돈 (문장 재조립 + 줄바꿈)
+# ============================================
+def reflow_body(text: str, meta: dict = None) -> str:
+    """
+    깨진 줄바꿈으로 조각난 본문을 문장 단위로 재조립하고,
+    가독성 있게 다시 줄바꿈한다.
+    """
+    if not text:
+        return ""
+
+    # 1) 모든 줄을 공백 하나로 이어붙임 (일단 한 줄로)
+    one_line = re.sub(r'\s+', ' ', text.replace('\n', ' ')).strip()
+
+    # 2) 메타테이블 값이 본문 앞에 붙어있으면 제거
+    #    ex) "고용노동부 제목 XXX 유형 YYY 담당부서 ZZZ ... 등록일 2026-07-30 실제본문..."
+    #    "등록일 YYYY-MM-DD" 패턴을 찾아 그 뒤부터 실제 본문으로 간주
+    m = re.search(r'등록일\s*20\d{2}[-.\/]\d{1,2}[-.\/]\d{1,2}\s*', one_line)
+    if m:
+        one_line = one_line[m.end():].strip()
+
+    # 3) 메타값 자체도 본문에 다시 나오면 제거 (예: "고용노동부" 로 시작하는 경우)
+    if meta:
+        for key in ("제목", "담당부서", "담당자", "전화번호", "유형"):
+            v = meta.get(key, "")
+            if v and len(v) >= 4 and v in one_line:
+                # 본문 앞쪽 200자 이내에서 반복될 때만 제거
+                idx = one_line.find(v)
+                if idx < 200:
+                    one_line = (one_line[:idx] + one_line[idx + len(v):]).strip()
+
+    # 4) 날짜 파편 병합: "2026. 5. 29." 처럼 사이 공백만 있으면 그대로 두고,
+    #    "2026 . 5 . 29 ." 같이 벌어진 건 붙임
+    one_line = re.sub(r'(\d{4})\s*\.\s*(\d{1,2})\s*\.\s*(\d{1,2})\s*\.', r'\1. \2. \3.', one_line)
+    one_line = re.sub(r'(\d{4})\s*\.\s*(\d{1,2})\s*\.', r'\1. \2.', one_line)
+
+    # 5) 하단 관련목록 트림: "○○○ 일부개정령" / "○○○ 일부 개정안" 같은
+    #    별도 게시글 제목들이 본문 끝에 붙어있으면 제거
+    #    (매우 보수적으로: 마지막 문장이 매우 짧고 "일부개정" / "개정안" / "고시" 로 끝나면 제거)
+    tail_patterns = [
+        r'\s*[^.。!?]{5,80}(일부개정령|일부 개정안|일부개정안|일부개정)\s*$',
+        r'\s*[^.。!?]{5,80}\s(고시|훈령|예규)\s*$',
+    ]
+    for _ in range(5):  # 최대 5개 꼬리 반복 제거
+        removed = False
+        for pat in tail_patterns:
+            new = re.sub(pat, '', one_line)
+            if new != one_line:
+                one_line = new.strip()
+                removed = True
+                break
+        if not removed:
+            break
+
+    # 6) 문장 단위 줄바꿈
+    #    - 한글/닫는괄호 뒤 마침표 + 공백 → 개행
+    #    - 물음표/느낌표 + 공백 → 개행
+    #    - 단, 숫자 마침표(2026. / 5. / 29.)는 제외 : 뒤 문자가 숫자면 개행 안 함
+    text = one_line
+
+    # 마침표 뒤 개행: 앞이 한글/닫는괄호/영문이고, 뒤가 공백 다음에 숫자가 아닌 경우
+    text = re.sub(r'(?<=[가-힣\)\]
+A-Za-z])\.\s+(?=[^\d\s])', '.\n', text)
+    # 물음표/느낌표 뒤 개행
+    text = re.sub(r'([!?])\s+(?=\S)', r'\1\n', text)
+    # "~다.", "~함.", "~음.", "~임.", "~됨." 뒤에도 확실히 개행 (한글 종결어미)
+    text = re.sub(r'(다|함|음|임|됨|요)\.\s+', r'\1.\n', text)
+
+    # 7) 특정 라벨 앞에서 개행 (붙임, 공포:, 시행:, * 등)
+    text = re.sub(r'\s+(?=(붙임|공포\s*:|시행\s*:|\*\s))', '\n', text)
+
+    # 8) 번호매김 앞 개행 (1. / 2. / 가. / 나.)
+    text = re.sub(r'\s+(?=\d{1,2}\.\s[가-힣A-Za-z])', '\n', text)
+    text = re.sub(r'\s+(?=[가-힣]\.\s[가-힣A-Za-z])', '\n', text)
+
+    # 9) 각 줄 트림 및 빈줄 정리
+    lines = [ln.strip() for ln in text.split('\n')]
+    lines = [ln for ln in lines if ln]
+
+    # 10) 너무 짧은 파편(1~2글자) 이 앞뒤 라인에 붙어야 자연스러운 경우 병합
+    merged = []
+    for ln in lines:
+        if merged and len(ln) <= 3 and re.match(r'^[\d\.\-]+$', ln):
+            # 숫자/기호만 있는 짧은 라인 → 앞줄에 병합
+            merged[-1] = merged[-1] + ' ' + ln
+        else:
+            merged.append(ln)
+
+    return '\n'.join(merged).strip()
 
 # ============================================
 # 📥 목록 크롤링
@@ -292,7 +256,8 @@ def fetch_list(target: dict, keyword: str) -> list[dict]:
     }
 
     print(f"\n📥 [{target['name']}] 목록 요청: {target['list_url']} (검색어={keyword})")
-    r = http_get(target['list_url'], params=params, timeout=30)   # 🆕 http_get (재시도 포함)
+    r = requests.get(target['list_url'], params=params, headers=HEADERS, timeout=30)
+    r.raise_for_status()
     r.encoding = r.apparent_encoding or 'utf-8'
 
     soup = BeautifulSoup(r.text, 'lxml')
@@ -321,6 +286,7 @@ def fetch_list(target: dict, keyword: str) -> list[dict]:
         title = clean_title(title_a.get_text(strip=True))
         if not title:
             continue
+
         if keyword not in title:
             continue
 
@@ -444,52 +410,37 @@ def extract_body_text(soup: BeautifulSoup, meta_table) -> str:
     return text.strip()
 
 # ============================================
-# 📄 상세 - 첨부파일 (dedup + 안정성 강화)
+# 📄 상세 - 첨부파일 (dedup)
 # ============================================
 def extract_attachments(soup: BeautifulSoup, base_url: str):
-    """
-    실제 다운로드 가능한 첨부파일만 추출 + 중복 제거.
-    """
     seen_urls = set()
     seen_names = set()
     result = []
 
     for a in soup.find_all('a'):
-        href = a.get('href', '') or ''
-        onclick = a.get('onclick', '') or ''
+        href = a.get('href', '')
+        onclick = a.get('onclick', '')
         text = a.get_text(strip=True)
 
         if not text:
             continue
 
-        # UI 라벨 제외
-        if text in ("첨부", "첨부파일", "다운로드", "바로보기", "미리보기", "보기", "다운로드 ⬇", "바로보기 ⓘ"):
+        if text in ("첨부", "첨부파일", "다운로드", "바로보기", "미리보기", "보기"):
             continue
 
-        # 파일 확장자 확인
         if not re.search(
-            r'\.(pdf|hwp|hwpx|doc|docx|xls|xlsx|ppt|pptx|zip|jpg|jpeg|png|gif|txt)',
+            r'\.(pdf|hwp|hwpx|doc|docx|xls|xlsx|ppt|pptx|zip|jpg|jpeg|png|gif|txt)(\s|$|\))',
             text, re.I
         ):
             continue
 
-        # 다운로드 URL 확정
         file_url = None
-        if href and href not in ('#', 'javascript:;', 'javascript:void(0)'):
-            if any(k in href.lower() for k in ('download', 'filedown', 'file', 'atch', 'attach')):
-                file_url = urljoin(base_url, href)
-            elif href.startswith('/') or href.startswith('http'):
-                file_url = urljoin(base_url, href)
-
-        if not file_url and onclick:
-            # onclick="fn_download('atchFileId','fileSn')" 등에서 URL 추출
-            m = re.search(r"['\"]([^'\"]*(?:file|download|atch)[^'\"]*)['\"]", onclick, re.I)
+        if href and ('download' in href.lower() or 'fileDown' in href or 'file' in href.lower()):
+            file_url = urljoin(base_url, href)
+        elif onclick:
+            m = re.search(r"['\"]([^'\"]*(?:file|download)[^'\"]*)['\"]", onclick, re.I)
             if m:
                 file_url = urljoin(base_url, m.group(1))
-
-        # 그래도 못 찾았지만 링크 텍스트가 명백한 파일이면 원문 링크에 있는 URL 그대로 사용
-        if not file_url and href:
-            file_url = urljoin(base_url, href)
 
         if not file_url:
             continue
@@ -509,19 +460,17 @@ def extract_attachments(soup: BeautifulSoup, base_url: str):
 # ============================================
 def fetch_detail(view_url: str) -> dict:
     try:
-        r = http_get(view_url, timeout=30)   # 🆕 http_get (재시도 포함)
+        r = requests.get(view_url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
         r.encoding = r.apparent_encoding or 'utf-8'
         soup = BeautifulSoup(r.text, 'lxml')
 
-        # 1) 첨부파일 (본문에서 지우기 전에!)
         attachments = extract_attachments(soup, view_url)
-
-        # 2) 메타
         meta, meta_table = extract_meta_table(soup)
-
-        # 3) 본문
         body = extract_body_text(soup, meta_table)
-        body = prettify_body(body)  # 🆕 가독성 향상
+
+        # 🆕 본문 재조립·줄바꿈 정돈
+        body = reflow_body(body, meta=meta)
 
         return {
             "meta": meta,
@@ -536,34 +485,47 @@ def fetch_detail(view_url: str) -> dict:
 # 📝 카페 본문 생성
 # ============================================
 def build_content(item: dict, target: dict, detail: dict) -> str:
+    kst = timezone(timedelta(hours=9))
+    now = datetime.now(kst).strftime("%Y-%m-%d %H:%M")
+
     meta = detail.get("meta", {})
     body = detail.get("body", "")
     attachments = detail.get("attachments", [])
 
-    # 메타정보 순서
     meta_order = ["제목", "유형", "담당부서", "전화번호", "담당자", "등록일"]
     meta_lines = []
     for key in meta_order:
         if key in meta and meta[key]:
-            meta_lines.append(f"<b>{key}</b> : {meta[key]}")
+            meta_lines.append(f"<b>{key}:</b> {meta[key]}")
     for k, v in meta.items():
         if k not in meta_order and v:
-            meta_lines.append(f"<b>{k}</b> : {v}")
+            meta_lines.append(f"<b>{k}:</b> {v}")
 
-    # 폴백
     if not meta_lines:
-        meta_lines.append(f"<b>제목</b> : {item['title']}")
+        meta_lines.append(f"<b>제목:</b> {item['title']}")
         if item.get('reg_date'):
-            meta_lines.append(f"<b>등록일</b> : {item['reg_date']}")
+            meta_lines.append(f"<b>등록일:</b> {item['reg_date']}")
 
     meta_html = "<br>".join(meta_lines)
 
-    # 본문 HTML 변환 (문단 단위 <p>, 줄바꿈 <br>)
-    body_html = text_to_html(body) if body else "<p>(본문을 불러오지 못했습니다. 아래 원문 링크에서 확인해 주세요.)</p>"
+    # 🆕 본문: 문단 단위 <p> + 줄바꿈 <br>
+    body_html = ""
+    if body:
+        # 빈 줄 기준으로 문단 분리 (없으면 전체가 한 문단)
+        paras = re.split(r'\n\s*\n', body)
+        html_paras = []
+        for p in paras:
+            p = p.strip()
+            if not p:
+                continue
+            html_paras.append(f"<p>{nl_to_br(p)}</p>")
+        body_html = "\n".join(html_paras)
+    else:
+        body_html = "<p>(본문을 불러오지 못했습니다. 아래 원문 링크에서 확인해 주세요.)</p>"
 
     parts = [
         f"<h3>{item['title']}</h3>",
-        f"<p><b>📂 구분</b> : 고용노동부 · {target['name']}</p>",
+        f"<p><b>📂 구분:</b> 고용노동부 · {target['name']}</p>",
         "<hr>",
         "<p><b>📋 상세정보</b></p>",
         f"<p>{meta_html}</p>",
@@ -572,18 +534,18 @@ def build_content(item: dict, target: dict, detail: dict) -> str:
         body_html,
     ]
 
-    # 첨부파일
     if attachments:
         parts.append("<hr>")
         parts.append(f"<p><b>📎 첨부파일 ({len(attachments)}건)</b></p>")
         parts.append("<ul>")
         for name, url in attachments:
-            parts.append(f'<li><a href="{url}" target="_blank">{name}</a></li>')
+            parts.append(f"<li><a href='{url}' target='_blank'>{name}</a></li>")
         parts.append("</ul>")
 
     parts.extend([
         "<hr>",
-        f'<p>👉 <a href="{item["view_url"]}" target="_blank"><b>고용노동부 원문 바로가기</b></a></p>',
+        f"<p>👉 <a href='{item['view_url']}' target='_blank'><b>고용노동부 원문 바로가기</b></a></p>",
+        f"<p><small>🤖 고용노동부 정보공개 자동 수집 · {now} KST</small></p>",
     ])
 
     return "\n".join(parts)
@@ -613,9 +575,8 @@ def post_to_cafe(token: str, subject: str, content: str) -> requests.Response:
         "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
     }
     subject_enc = naver_double_encode(subject)
-    # 본문: 한글만 엔티티화 (태그는 보존) → 그다음 URL 인코딩
     content_html = to_html_entity(content)
-    content_enc = quote(content_html, safe='')
+    content_enc = quote(content_html)
 
     body = f"subject={subject_enc}&content={content_enc}&openyn=true"
     r = requests.post(url, headers=headers, data=body, timeout=60)
@@ -657,7 +618,7 @@ def run():
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst)
     print("=" * 60)
-    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v3.1)")
+    print("🏭 고용노동부 안전 공고 → 네이버 카페 자동 게시 (v2.1)")
     print(f"⏰ {now.strftime('%Y-%m-%d %H:%M KST')}")
     print("=" * 60)
 
